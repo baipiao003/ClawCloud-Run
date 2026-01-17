@@ -4,6 +4,7 @@ ClawCloud 自动登录脚本
 - 等待设备验证批准（30秒）
 - 每次登录后自动更新 Cookie
 - Telegram 通知
+- 支持三种验证方式：邮箱链接、GitHub App、Telegram验证码
 """
 
 import base64
@@ -301,36 +302,155 @@ class AutoLogin:
             self.log("已通过 Telegram 发送 Cookie", "SUCCESS")
     
     def wait_device(self, page):
-        """等待设备验证"""
+        """等待设备验证 - 支持三种验证方式"""
         self.log(f"需要设备验证，等待 {DEVICE_VERIFY_WAIT} 秒...", "WARN")
         self.shot(page, "设备验证")
         
+        # 更新通知消息，添加第三种方式
         self.tg.send(f"""⚠️ <b>需要设备验证</b>
 
 请在 {DEVICE_VERIFY_WAIT} 秒内批准：
 1️⃣ 检查邮箱点击链接
-2️⃣ 或在 GitHub App 批准""")
+2️⃣ 或在 GitHub App 批准
+3️⃣ 或在 Telegram 发送 /code 123456（如收到邮件验证码）""")
         
         if self.shots:
             self.tg.photo(self.shots[-1], "设备验证页面")
         
-        for i in range(DEVICE_VERIFY_WAIT):
-            time.sleep(1)
-            if i % 5 == 0:
-                self.log(f"  等待... ({i}/{DEVICE_VERIFY_WAIT}秒)")
+        # 设置 Telegram 验证码监听
+        deadline = time.time() + DEVICE_VERIFY_WAIT
+        
+        # 刷新 offset 避免读到旧消息
+        offset = self.tg.flush_updates()
+        pattern = re.compile(r"^/code\s+(\d{6,8})$")
+        
+        while time.time() < deadline:
+            try:
+                # 检查 URL 是否已变化（表示验证通过）
                 url = page.url
                 if 'verified-device' not in url and 'device-verification' not in url:
                     self.log("设备验证通过！", "SUCCESS")
                     self.tg.send("✅ <b>设备验证通过</b>")
                     return True
-                try:
-                    page.reload(timeout=10000)
-                    page.wait_for_load_state('networkidle', timeout=10000)
-                except:
-                    pass
+                
+                # 每隔5秒尝试从 Telegram 获取验证码
+                if int(time.time()) % 5 == 0:
+                    try:
+                        r = requests.get(
+                            f"https://api.telegram.org/bot{self.tg.token}/getUpdates",
+                            params={"timeout": 2, "offset": offset},
+                            timeout=5
+                        )
+                        data = r.json()
+                        if data.get("ok"):
+                            for upd in data.get("result", []):
+                                offset = upd["update_id"] + 1
+                                msg = upd.get("message") or {}
+                                chat = msg.get("chat") or {}
+                                if str(chat.get("id")) != str(self.tg.chat_id):
+                                    continue
+                                
+                                text = (msg.get("text") or "").strip()
+                                m = pattern.match(text)
+                                if m:
+                                    code = m.group(1)
+                                    self.log(f"收到 Telegram 验证码: {code}", "INFO")
+                                    self.tg.send(f"✅ 收到验证码，正在填入...")
+                                    
+                                    # 尝试在页面上找到验证码输入框并填入
+                                    code_selectors = [
+                                        'input[name="otp"]',
+                                        'input[name="code"]',
+                                        'input[autocomplete="one-time-code"]',
+                                        'input[inputmode="numeric"]',
+                                        'input[type="text"]',
+                                        'input[type="number"]'
+                                    ]
+                                    
+                                    for sel in code_selectors:
+                                        try:
+                                            el = page.locator(sel).first
+                                            if el.is_visible(timeout=1000):
+                                                el.click()
+                                                time.sleep(random.uniform(0.2, 0.5))
+                                                el.fill("")
+                                                el.type(code, delay=random.randint(50, 150))
+                                                self.log("已填入验证码", "SUCCESS")
+                                                
+                                                # 提交
+                                                time.sleep(1)
+                                                submit_selectors = [
+                                                    'button[type="submit"]',
+                                                    'input[type="submit"]',
+                                                    'button:has-text("Verify")',
+                                                    'button:has-text("Continue")',
+                                                    'button:has-text("确认")'
+                                                ]
+                                                for submit_sel in submit_selectors:
+                                                    try:
+                                                        btn = page.locator(submit_sel).first
+                                                        if btn.is_visible(timeout=1000):
+                                                            btn.click()
+                                                            self.log("已提交验证码", "SUCCESS")
+                                                            time.sleep(3)
+                                                            break
+                                                    except:
+                                                        pass
+                                                
+                                                break
+                                        except:
+                                            pass
+                                    
+                                    # 等待页面响应
+                                    time.sleep(3)
+                                    try:
+                                        page.wait_for_load_state('networkidle', timeout=10000)
+                                    except:
+                                        pass
+                                    
+                                    # 重新检查是否通过
+                                    url = page.url
+                                    if 'verified-device' not in url and 'device-verification' not in url:
+                                        self.log("设备验证通过！", "SUCCESS")
+                                        self.tg.send("✅ <b>设备验证通过</b>")
+                                        return True
+                                    else:
+                                        self.log("验证码可能不正确", "WARN")
+                                        self.tg.send("⚠️ 验证码可能不正确，请检查")
+                    except Exception as e:
+                        # 忽略 Telegram API 错误
+                        pass
+                
+                # 每10秒打印一次等待状态
+                elapsed = int(time.time() - (deadline - DEVICE_VERIFY_WAIT))
+                if elapsed % 10 == 0:
+                    self.log(f"  等待设备验证... ({elapsed}/{DEVICE_VERIFY_WAIT}秒)")
+                    
+                    # 偶尔刷新页面
+                    if elapsed % 20 == 0:
+                        try:
+                            page.reload(timeout=10000)
+                            page.wait_for_load_state('domcontentloaded', timeout=10000)
+                        except:
+                            pass
+                
+                time.sleep(1)
+                
+            except Exception as e:
+                self.log(f"设备验证循环异常: {e}", "WARN")
+                time.sleep(2)
         
-        if 'verified-device' not in page.url:
-            return True
+        # 最终检查
+        try:
+            page.reload(timeout=10000)
+            page.wait_for_load_state('domcontentloaded', timeout=10000)
+            url = page.url
+            if 'verified-device' not in url and 'device-verification' not in url:
+                self.log("设备验证通过！", "SUCCESS")
+                self.tg.send("✅ <b>设备验证通过</b>")
+                return True
+        except:
+            pass
         
         self.log("设备验证超时", "ERROR")
         self.tg.send("❌ <b>设备验证超时</b>")
