@@ -309,10 +309,10 @@ class AutoLogin:
         # 更新通知消息，添加第三种方式
         self.tg.send(f"""⚠️ <b>需要设备验证</b>
 
-请在 {DEVICE_VERIFY_WAIT} 秒内批准：
+用户{self.username}正在登录，请在 {DEVICE_VERIFY_WAIT} 秒内批准：
 1️⃣ 检查邮箱点击链接
 2️⃣ 或在 GitHub App 批准
-3️⃣ 或在 Telegram 发送 /code 123456（如收到邮件验证码）""")
+3️⃣ 或在 Telegram 发送 /code""")
         
         if self.shots:
             self.tg.photo(self.shots[-1], "设备验证页面")
